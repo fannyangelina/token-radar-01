@@ -76,7 +76,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2-comparables';
+export const MODEL_VERSION = 'radar-3-clean-heldout';
 
 /** One farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -113,6 +113,7 @@ export interface BoardRow {
     age_days: number | null;
   };
   farm_steps: string[];
+  break_even: BreakEven;
 }
 
 /** The dashboard's compact view of one row. */
@@ -135,6 +136,7 @@ export interface RadarRow {
   comparable_source: 'category' | 'global';
   momentum_factor: number;
   maturity_factor: number;
+  break_even: BreakEven;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value. */
@@ -161,6 +163,8 @@ export interface RadarData {
   live_size: number;
   global_multiple: number;
   median_age_days: number;
+  held_out: HeldOutTest;
+  accounting: Accounting;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -228,8 +232,11 @@ export function isRankable(p: SnapshotProtocol): boolean {
  * The comparables: for every category, the median mcap/tvl of the tokened protocols
  * in that category, computed from this snapshot. A category with fewer than
  * `minComparables` tokened protocols falls back to the global median — a single
- * outlier never sets a category's multiple. Returns the per-category map, the
- * global median, and the median age of the snapshot (for protocols with no listed_at).
+ * outlier never sets a category's multiple. A comparable must be a token that
+ * actually trades at a positive value: protocols whose mcap is 0 or negative are
+ * dead tokens, not comparables, and are left out (16 of them in this snapshot).
+ * Returns the per-category map, the global median, and the median age of the
+ * snapshot (for protocols with no listed_at).
  */
 export function computeComparables(snapshot: Snapshot, model: ModelConstants): {
   byCategory: Map<string, { multiple: number; count: number }>;
@@ -239,7 +246,7 @@ export function computeComparables(snapshot: Snapshot, model: ModelConstants): {
   const byCategory = new Map<string, number[]>();
   const global: number[] = [];
   for (const p of snapshot.protocols) {
-    if (p.mcap_usd !== null && p.tvl_usd > 0) {
+    if (p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0) {
       const ratio = p.mcap_usd / p.tvl_usd;
       global.push(ratio);
       if (p.category !== null) {
@@ -285,6 +292,189 @@ export function comparableFor(
 export function momentumFactor(change7d: number | null, model: ModelConstants): number {
   if (change7d === null) return 1;
   return Math.min(model.momentum_cap, Math.max(model.momentum_floor, 1 + (change7d / 100) * model.momentum_weight));
+}
+
+/** One held-out result: how a predictor scores on the tokened protocols it did not see. */
+export interface HeldOutTest {
+  /** Tokened protocols with a positive mcap that the test scores. */
+  n: number;
+  /** Median |log(predicted mcap / actual mcap)| for the full model (multiple x momentum x maturity). */
+  model_median_log_err: number;
+  /** The same, for a flat global multiple (no category, no momentum, no maturity). */
+  flat_median_log_err: number;
+  /** The same, for TVL alone (no multiple at all). */
+  tvl_median_log_err: number;
+  /** Share of protocols whose predicted mcap lands within 2x of the actual, for the full model. */
+  model_within_2x: number;
+  /** The same, for the flat multiple. */
+  flat_within_2x: number;
+  /** Spearman rank correlation between predicted and actual mcap, for the full model. */
+  model_spearman: number;
+  /** The same, for TVL alone. */
+  tvl_spearman: number;
+}
+
+/** The median of a list of numbers (the list is sorted in place). */
+function medianOf(values: number[]): number {
+  values.sort((a, b) => a - b);
+  return median(values);
+}
+
+/** Spearman rank correlation between two equal-length lists. */
+function spearman(x: number[], y: number[]): number {
+  const ranks = (a: number[]): number[] => {
+    const idx = a.map((v, i) => [v, i] as [number, number]).sort((p, q) => p[0] - q[0]);
+    const r = new Array<number>(a.length);
+    let i = 0;
+    while (i < idx.length) {
+      let j = i;
+      while (j + 1 < idx.length && idx[j + 1]![0] === idx[i]![0]) j++;
+      const avg = (i + j) / 2 + 1;
+      for (let k = i; k <= j; k++) r[idx[k]![1]] = avg;
+      i = j + 1;
+    }
+    return r;
+  };
+  const rx = ranks(x);
+  const ry = ranks(y);
+  const n = x.length;
+  const mx = rx.reduce((a, b) => a + b, 0) / n;
+  const my = ry.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let dx = 0;
+  let dy = 0;
+  for (let i = 0; i < n; i++) {
+    num += (rx[i]! - mx) * (ry[i]! - my);
+    dx += (rx[i]! - mx) ** 2;
+    dy += (ry[i]! - my) ** 2;
+  }
+  return dx === 0 || dy === 0 ? 0 : num / Math.sqrt(dx * dy);
+}
+
+/**
+ * The held-out test: leave-one-out over the tokened protocols with a positive mcap.
+ * For each one, the model predicts its mcap from the multiples computed WITHOUT it
+ * (its own category median without it, else the global median without it), times its
+ * momentum and maturity — the same formula the board uses. The flat predictor uses
+ * only the global median without it; TVL alone uses no multiple. The test is
+ * deterministic: it iterates the snapshot in slug order and uses no randomness.
+ * It is reported honestly in the Methodology, including where the full model trails
+ * TVL alone on pure mcap ranking — the extra terms buy launch-timing signal (growth
+ * and wait time) that a TVL-only ranking cannot express.
+ */
+export function heldOutTest(snapshot: Snapshot, model: ModelConstants): HeldOutTest {
+  const comps = snapshot.protocols
+    .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
+    .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const comparables = computeComparables(snapshot, model);
+  const byCat = new Map<string, number[]>();
+  const globalRatios: number[] = [];
+  for (const p of comps) {
+    const r = p.mcap_usd! / p.tvl_usd;
+    globalRatios.push(r);
+    if (p.category !== null) {
+      const list = byCat.get(p.category) ?? [];
+      list.push(r);
+      byCat.set(p.category, list);
+    }
+  }
+  const medianExcl = (arr: number[], val: number): number => {
+    const copy = [...arr];
+    const i = copy.indexOf(val);
+    if (i >= 0) copy.splice(i, 1);
+    if (copy.length === 0) return comparables.globalMultiple;
+    return medianOf(copy);
+  };
+  const modelErr: number[] = [];
+  const flatErr: number[] = [];
+  const tvlErr: number[] = [];
+  let modelWithin = 0;
+  let flatWithin = 0;
+  const actual: number[] = [];
+  const predModel: number[] = [];
+  const predTvl: number[] = [];
+  for (const p of comps) {
+    const actualMcap = p.mcap_usd!;
+    const ratio = actualMcap / p.tvl_usd;
+    const gMed = medianExcl(globalRatios, ratio);
+    let mult = gMed;
+    if (p.category !== null) {
+      const list = byCat.get(p.category) ?? [];
+      const nExcl = list.length - 1;
+      if (nExcl >= model.min_comparables) mult = medianExcl(list, ratio);
+    }
+    const mom = momentumFactor(p.change_7d, model);
+    const age = ageDays(snapshot.as_of, p.listed_at);
+    const mat = maturityFactor(age, comparables.medianAgeDays, model);
+    const pm = p.tvl_usd * mult * mom * mat;
+    const pf = p.tvl_usd * gMed;
+    const pt = p.tvl_usd;
+    modelErr.push(Math.abs(Math.log(pm / actualMcap)));
+    flatErr.push(Math.abs(Math.log(pf / actualMcap)));
+    tvlErr.push(Math.abs(Math.log(pt / actualMcap)));
+    if (pm / actualMcap >= 0.5 && pm / actualMcap <= 2) modelWithin++;
+    if (pf / actualMcap >= 0.5 && pf / actualMcap <= 2) flatWithin++;
+    actual.push(actualMcap);
+    predModel.push(pm);
+    predTvl.push(pt);
+  }
+  const n = comps.length;
+  return {
+    n,
+    model_median_log_err: round4(medianOf(modelErr)),
+    flat_median_log_err: round4(medianOf(flatErr)),
+    tvl_median_log_err: round4(medianOf(tvlErr)),
+    model_within_2x: round4(modelWithin / n),
+    flat_within_2x: round4(flatWithin / n),
+    model_spearman: round4(spearman(actual, predModel)),
+    tvl_spearman: round4(spearman(actual, predTvl)),
+  };
+}
+
+/** The full accounting of the snapshot: every protocol is counted, none is dropped silently. */
+export interface Accounting {
+  total: number;
+  tokened: number;
+  pre_token: number;
+  rankable: number;
+  filtered: number;
+  /** The house rule that excludes each filtered protocol, first match wins. */
+  filtered_by: { reason: string; count: number }[];
+  /** Tokened protocols with a positive mcap that stand behind the comparables. */
+  comparables: number;
+  /** Tokened protocols whose mcap is 0 or negative: dead tokens, left out of the comparables. */
+  dead_mcap_le_zero: number;
+}
+
+/** Count every protocol in the snapshot, and name the rule that excludes each filtered one. */
+export function accounting(snapshot: Snapshot): Accounting {
+  const tokened = snapshot.protocols.filter((p) => !isPreToken(p));
+  const preToken = snapshot.protocols.filter(isPreToken);
+  const rankable = snapshot.protocols.filter(isRankable);
+  const filtered = preToken.filter((p) => !isRankable(p));
+  const byReason = new Map<string, number>();
+  for (const p of filtered) {
+    let reason: string;
+    if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) reason = `category ${p.category}`;
+    else if (VERSIONED.test(p.name)) reason = 'versioned name';
+    else if (/\bwrapped\b|\bstaked\b|\bstaking\b/i.test(p.name)) reason = 'wrapped or staked word in the name';
+    else if (EXCHANGE_PREFIXES.some((x) => p.name.startsWith(x))) reason = 'exchange name prefix';
+    else reason = 'other house rule';
+    byReason.set(reason, (byReason.get(reason) ?? 0) + 1);
+  }
+  const filtered_by = [...byReason.entries()]
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((a, b) => b.count - a.count || (a.reason < b.reason ? -1 : 1));
+  return {
+    total: snapshot.protocols.length,
+    tokened: tokened.length,
+    pre_token: preToken.length,
+    rankable: rankable.length,
+    filtered: filtered.length,
+    filtered_by,
+    comparables: snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0).length,
+    dead_mcap_le_zero: snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd <= 0).length,
+  };
 }
 
 /** The maturity factor: older protocols with no token rank higher, up to the cap. */
@@ -376,6 +566,44 @@ function gasFor(chain: string): { tier: string; tx: string } {
     return { tier: chain, tx: '$0.10–$1 per transaction' };
   }
   return { tier: chain, tx: '$0.50–$2 per transaction' };
+}
+
+/** The midpoint gas cost of one transaction on a chain, in USD, for the break-even. */
+function gasUsdMid(chain: string): number {
+  const c = chain.toLowerCase();
+  if (c === 'ethereum') return 8.5;
+  if (c === 'solana') return 0.01;
+  if (['arbitrum', 'optimism', 'base', 'zksync', 'polygon', 'blast', 'linea', 'scroll', 'mode', 'mantle', 'opbnb'].includes(c)) return 0.28;
+  if (['bnb chain', 'avalanche', 'tron', 'fantom', 'gnosis'].includes(c)) return 0.55;
+  return 1.25;
+}
+
+/** A farm plan netted to its break-even: what the plan costs, in gas and in active time. */
+export interface BreakEven {
+  /** Total gas the plan spends, in USD (setup + one transaction a week + the claim). */
+  gas_usd: number;
+  /** Active time the plan asks for, in hours (setup + weekly actions + claim + log). */
+  active_hours: number;
+  /** Gas per active hour: the allocation must be worth at least this much per hour to cover its cost. */
+  usd_per_hour: number;
+  /** Whole weeks the plan runs (the hold, rounded up to weeks). */
+  weeks: number;
+}
+
+/**
+ * A plan's break-even, from its own chain and hold: the gas of one setup transaction,
+ * one a week through the hold, and the claim, over the active minutes the steps name.
+ * The capital stays in the position, so it is not a cost — only the gas is.
+ */
+export function breakEvenFor(p: SnapshotProtocol, age: number | null): BreakEven {
+  const chain = chainOf(p);
+  const hold = holdDaysFor(age);
+  const weeks = Math.max(1, Math.ceil(hold / 7));
+  const txs = 1 + weeks + 1;
+  const gas = round2(txs * gasUsdMid(chain));
+  const activeMinutes = 1 + 5 + 15 + 10 * weeks + 10 + 5;
+  const hours = round2(activeMinutes / 60);
+  return { gas_usd: gas, active_hours: hours, usd_per_hour: round2(gas / hours), weeks };
 }
 
 /** How much capital one farm position needs, from the protocol's own TVL band. */
@@ -553,10 +781,12 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
         age_days: s.age,
       },
       farm_steps: farmSteps(s.p, s.age, verdict, reason).map(stepText),
+      break_even: breakEvenFor(s.p, s.age),
     };
   });
 }
 
+const round2 = (n: number): number => Math.round(n * 100) / 100;
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
 
@@ -581,6 +811,7 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     comparable_source: row.model.comparable_source,
     momentum_factor: row.model.momentum_factor,
     maturity_factor: row.model.maturity_factor,
+    break_even: row.break_even,
   };
 }
 
@@ -603,6 +834,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live_size: live.length,
     global_multiple: round6(comparables.globalMultiple),
     median_age_days: comparables.medianAgeDays,
+    held_out: heldOutTest(snapshot, model),
+    accounting: accounting(snapshot),
     rows: board.map((r) => radarRow(r, watchSet)),
     live,
   };
