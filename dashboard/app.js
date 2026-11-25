@@ -147,6 +147,30 @@
     D.watchlist_size + '/' + D.watchlist_size + ' watchlist covered · ' + D.early_size + ' early candidates found beyond it · ' + D.board_size + ' rows in all.';
   document.getElementById('sourceLine').textContent =
     'Snapshot: ' + D.source + '. Model ' + D.model_version + '. Global comparable multiple ' + D.global_multiple.toFixed(4) + '; median age with no token ' + D.median_age_days + ' days.';
+  /* Accounting strip: every protocol in the snapshot is counted, none dropped silently. */
+  if (D.accounting) {
+    var A = D.accounting;
+    document.getElementById('accountingLine').textContent =
+      A.total + ' protocols in the snapshot: ' + A.tokened + ' already trading · ' + A.pre_token + ' record no token · ' +
+      A.rankable + ' rankable · ' + A.filtered + ' set aside by the house rules.';
+    var by = A.filtered_by.map(function (f) { return f.reason + ' ' + f.count; }).join(', ');
+    document.getElementById('accountingDetail').textContent =
+      'Of the ' + A.total + ' protocols, ' + A.tokened + ' already trade and ' + A.pre_token + ' record no token. ' +
+      'Of those ' + A.pre_token + ', ' + A.rankable + ' are rankable and ' + A.filtered + ' are set aside by the house rules: ' + by + '. ' +
+      'The comparables come from ' + A.comparables + ' tokened protocols with a positive market cap; ' +
+      A.dead_mcap_le_zero + ' tokened protocols whose market cap is 0 or negative are dead tokens and are left out of the comparables.';
+  }
+  /* Held-out test, reported honestly: leave-one-out over the tokened protocols. */
+  if (D.held_out) {
+    var H = D.held_out;
+    document.getElementById('heldOutLine').textContent =
+      'Leave-one-out over the ' + H.n + ' tokened protocols with a positive market cap: for each one, the model predicts its market cap from the multiples computed without it. ' +
+      'The full model lands within 2× of the actual market cap for ' + Math.round(H.model_within_2x * 100) + '% (median |log error| ' + H.model_median_log_err.toFixed(2) + '), ' +
+      'against ' + Math.round(H.flat_within_2x * 100) + '% for a flat global multiple (median |log error| ' + H.flat_median_log_err.toFixed(2) + '). ' +
+      'On pure market-cap ranking the full model scores Spearman ' + H.model_spearman.toFixed(2) + ' against ' + H.tvl_spearman.toFixed(2) + ' for TVL alone: ' +
+      'TVL is the strongest single ranker of market cap, and the extra terms trade a little of that for launch-timing signal — seven-day growth and wait time — that a TVL-only ranking cannot express. ' +
+      'The board ranks launches, not market caps, so the terms stay; the test is here so the reader can see the trade-off.';
+  }
 
   /* ---------- filters ---------- */
   var catSel = document.getElementById('category');
@@ -249,6 +273,10 @@
     var steps = buildFarmPlan(row).map(function (s) {
       return '<li>' + esc(s.text) + ' <span class="cost">Cost: ' + esc(s.cost) + '. Time: ' + esc(s.time) + '.</span></li>';
     }).join('');
+    var be = row.break_even;
+    var beText = be
+      ? '<p><strong>Break-even.</strong> This plan spends about $' + be.gas_usd.toFixed(2) + ' in gas (one setup transaction, one a week for ' + be.weeks + ' weeks, and the claim) over ' + be.active_hours.toFixed(2) + ' active hours — so the allocation must be worth at least $' + be.usd_per_hour.toFixed(2) + ' per hour of your time to cover its cost. The capital stays in the position, so it is not counted as a cost.</p>'
+      : '';
     dialog.innerHTML = '<div class="detail"><button class="close" type="button" aria-label="Close">Close ×</button>' +
       '<h2>' + esc(row.name) + '</h2>' +
       '<p class="meta">Rank ' + row.rank + ' · ' + esc(row.category || 'Uncategorised') + ' · ' + esc((row.chains || []).join(', ') || '—') +
@@ -263,7 +291,7 @@
       '</tbody></table>' +
       '<h3>Farm plan — ' + esc(row.verdict) + '</h3>' +
       '<p>' + esc(row.verdict_reason) + '</p>' +
-      '<ol class="plan">' + steps + '</ol></div>';
+      '<ol class="plan">' + steps + '</ol>' + beText + '</div>';
     dialog.querySelector('.close').addEventListener('click', function () { dialog.close(); });
     dialog.showModal();
     try { history.replaceState(null, '', '#/protocol/' + row.slug); } catch (e) {}

@@ -21,6 +21,7 @@ h1{margin:0 0 12px;font-size:28px;line-height:1.2;letter-spacing:-.01em;max-widt
 .facts div{display:flex;flex-direction:column}
 .facts dt{font-size:12px;color:var(--muted)}
 .facts dd{margin:2px 0 0;font-size:20px;font-weight:700}
+.accounting{margin:16px 0 0;font-size:13px;color:var(--muted);border-top:1px solid var(--line);padding-top:12px}
 .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:end;padding:24px 0 12px}
 .controls label{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:4px}
 .controls input,.controls select{font:inherit;color:var(--ink);background:var(--surface);
