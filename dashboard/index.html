@@ -15,6 +15,7 @@
     <p class="lede">Every protocol DefiLlama tracks that records no token, ranked by the implied value of its launch. The value follows from the snapshot's own figures: TVL, the category's tokened comparables, seven-day growth, and how long it has run with no token. No name is special-cased. No row is hand-picked.</p>
     <dl class="facts" id="facts"></dl>
     <p class="accounting" id="accountingLine"></p>
+    <div class="ledger" id="ledgerBar"></div>
   </div>
 </header>
 <main class="wrap" id="board" tabindex="-1">
@@ -61,11 +62,13 @@
     <p><strong>Coverage.</strong> The board ranks every protocol in the sealed snapshot that records no token (<code>gecko_id</code> and <code>symbol</code> both null) and is not a wrapped, staked or bridged product of one that trades — that is the 40-protocol watchlist (TVL at or above the $50M floor) plus every rankable protocol below it. <span id="coverageLine"></span></p>
     <p><strong>Accounting — all 758 protocols are counted.</strong> <span id="accountingDetail"></span></p>
     <p><strong>Held-out test.</strong> <span id="heldOutLine"></span></p>
+    <p><strong>Uncertainty intervals.</strong> <span id="intervalLine"></span></p>
+    <div id="coverageTable"></div>
     <p><strong>Implied value.</strong> <code>implied_value_usd = round(tvl_usd × comparable_multiple × momentum_factor × maturity_factor)</code>, clamped to $1,000,000 – $100,000,000,000,000.</p>
     <ul>
-      <li><strong>comparable_multiple</strong> — the median <code>mcap_usd / tvl_usd</code> of the tokened protocols in the same category, computed from this snapshot at runtime. A category with fewer than 3 tokened comparables uses the global median instead, so one outlier never sets the multiple. A comparable must be a token that actually trades at a positive value: protocols whose market cap is 0 or negative are dead tokens and are left out of the comparables. Zero hardcoded names, zero hardcoded prices.</li>
-      <li><strong>momentum_factor</strong> — <code>clamp(1 + change_7d / 100 × 0.5, 0.8, 1.5)</code>. A protocol whose TVL grew 20% in 7 days scores 1.10; one that fell 20% scores 0.90. No reported 7-day change is neutral, 1.0.</li>
-      <li><strong>maturity_factor</strong> — <code>0.6 + min(age_days, 1095) / 1095 × 0.4</code>. Age is the days from <code>listed_at</code> to the snapshot date; a protocol with no <code>listed_at</code> uses the snapshot's median age. Long-running and growing ranks higher.</li>
+      <li><strong>comparable_multiple</strong> — the geometric mean <code>mcap_usd / tvl_usd</code> of the tokened protocols in the same category, computed from this snapshot at runtime, shrunk toward the global geometric mean: <code>multiple = globalGeo × (categoryGeo / globalGeo)^0.5</code>. A category with fewer than 10 tokened comparables uses the global geometric mean instead, so one outlier never sets the multiple. A comparable must be a token that actually trades at a positive value: protocols whose market cap is 0 or negative are dead tokens and are left out of the comparables. Zero hardcoded names, zero hardcoded prices.</li>
+      <li><strong>momentum_factor</strong> — <code>clamp(1 + change_7d / 100 × 0.1, 0.8, 1.5)</code>. A protocol whose TVL grew 20% in 7 days scores 1.02; one that fell 20% scores 0.98. No reported 7-day change is neutral, 1.0. The weight is deliberately small: growth is a timing signal, not the value itself.</li>
+      <li><strong>maturity_factor</strong> — <code>0.9 + min(age_days, 1095) / 1095 × 0.1</code>. Age is the days from <code>listed_at</code> to the snapshot date; a protocol with no <code>listed_at</code> uses the snapshot's median age. Long-running and growing ranks higher, but only slightly — the factor moves the value by at most 10%.</li>
     </ul>
     <p><strong>Verdicts.</strong> Farm now — implied value $25M or more. Watch — $5M or more. Skip — below $5M. Each plan opens with the one decisive reason for its verdict.</p>
     <p><strong>Farm plans.</strong> Every step is generated from the protocol's own category, chains, TVL band and age: the action, the principal (TVL band $250–$2,000), the gas cost for its chain, and the time. Ethereum L1 runs about $2–$15 a transaction, L2s about $0.05–$0.50, Solana about $0.01. Each plan is netted to its break-even: the gas of one setup transaction, one a week through the hold, and the claim, over the active hours the steps name — so the allocation must be worth at least that much per hour to cover its cost. The capital stays in the position, so it is not counted as a cost.</p>

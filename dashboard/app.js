@@ -10,11 +10,11 @@
   /* ---------- model: the same factors main.ts uses, recomputed here ---------- */
   function momentumFactor(change7d) {
     if (change7d === null || change7d === undefined) return 1;
-    return Math.min(1.5, Math.max(0.8, 1 + (change7d / 100) * 0.5));
+    return Math.min(D.model.momentum_cap, Math.max(D.model.momentum_floor, 1 + (change7d / 100) * D.model.momentum_weight));
   }
   function maturityFactor(ageDays) {
     var a = ageDays === null || ageDays === undefined ? D.median_age_days : ageDays;
-    return 0.6 + (Math.min(Math.max(a, 0), 1095) / 1095) * 0.4;
+    return D.model.maturity_floor + (Math.min(Math.max(a, 0), D.model.maturity_days) / D.model.maturity_days) * D.model.maturity_range;
   }
   /** The implied value of one row, recomputed from its stored factors: the
       same multiplication main.ts performs, so the page and the board agree. */
@@ -117,6 +117,13 @@
 
   /* ---------- formatting ---------- */
   function fmtUSD(n) { return '$' + Math.round(n).toLocaleString('en-US'); }
+  /** Compact dollars for the interval sub-line: $25.9M, $2.4B. */
+  function fmtCompact(n) {
+    if (n >= 1000000000) return '$' + (n / 1000000000).toFixed(1) + 'B';
+    if (n >= 1000000) return '$' + (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return '$' + (n / 1000).toFixed(1) + 'K';
+    return '$' + Math.round(n);
+  }
   function fmtPct(n) {
     if (n === null || n === undefined) return '—';
     var s = (n >= 0 ? '+' : '') + n.toFixed(1) + '%';
@@ -169,8 +176,44 @@
       'against ' + Math.round(H.flat_within_2x * 100) + '% for a flat global multiple (median |log error| ' + H.flat_median_log_err.toFixed(2) + '). ' +
       'On pure market-cap ranking the full model scores Spearman ' + H.model_spearman.toFixed(2) + ' against ' + H.tvl_spearman.toFixed(2) + ' for TVL alone: ' +
       'TVL is the strongest single ranker of market cap, and the extra terms trade a little of that for launch-timing signal — seven-day growth and wait time — that a TVL-only ranking cannot express. ' +
-      'The board ranks launches, not market caps, so the terms stay; the test is here so the reader can see the trade-off.';
+      'The board ranks launches, not market caps, so the terms stay; the test is here so the reader can see the trade-off. ' +
+      (D.interval_note || '');
   }
+  /* Uncertainty intervals: the honest range around every implied value. */
+  if (D.intervals) {
+    var IV = D.intervals;
+    document.getElementById('intervalLine').textContent =
+      'Every row shows its P25–P75 range under the implied value. The multipliers come from the same leave-one-out test: ' +
+      'for each of the ' + (D.held_out ? D.held_out.n : 128) + ' tokened protocols, the ratio of actual to predicted market cap is recorded, ' +
+      'and the range is the 25th to the 75th percentile of those ratios (×' + IV.p25.toFixed(4) + ' to ×' + IV.p75.toFixed(4) + '). ' +
+      'The wider P10–P90 range is ×' + IV.p10.toFixed(4) + ' to ×' + IV.p90.toFixed(4) + '. ' + (D.interval_note || '');
+    var n = D.held_out ? D.held_out.n : 128;
+    var c2575 = Math.round(IV.coverage_2575 * n);
+    var c1090 = Math.round(IV.coverage_1090 * n);
+    document.getElementById('coverageTable').innerHTML =
+      '<table class="coverage"><thead><tr><th>Range</th><th class="num">Multiplier on the implied value</th><th class="num">Actuals inside</th></tr></thead><tbody>' +
+      '<tr><td>P25–P75 — the range shown on every row</td><td class="num">×' + IV.p25.toFixed(4) + ' – ×' + IV.p75.toFixed(4) + '</td><td class="num">' + (IV.coverage_2575 * 100).toFixed(1) + '% (' + c2575 + ' of ' + n + ')</td></tr>' +
+      '<tr><td>P10–P90 — the wide range</td><td class="num">×' + IV.p10.toFixed(4) + ' – ×' + IV.p90.toFixed(4) + '</td><td class="num">' + (IV.coverage_1090 * 100).toFixed(1) + '% (' + c1090 + ' of ' + n + ')</td></tr>' +
+      '</tbody></table>';
+  }
+  /* Ledger bar: all 758 protocols in ten groups, first match wins. */
+  function ledgerBar() {
+    var el = document.getElementById('ledgerBar');
+    if (!el || !D.ledger) return;
+    var total = D.ledger.reduce(function (s, g) { return s + g.count; }, 0);
+    var cls = ['tok', 'tok', 'rank', 'rank', 'rank', 'out', 'out', 'out', 'out', 'out'];
+    var segs = D.ledger.map(function (g, i) {
+      var w = total ? (g.count / total * 100) : 0;
+      return '<span class="seg ' + cls[i] + '" style="width:' + w.toFixed(2) + '%" title="' + esc(g.label) + ': ' + g.count + '"></span>';
+    }).join('');
+    var legend = D.ledger.map(function (g, i) {
+      return '<span class="lg"><i class="sw ' + cls[i] + '"></i>' + esc(g.label) + ' <b>' + g.count + '</b></span>';
+    }).join('');
+    el.innerHTML = '<p class="ledger-title">Ledger — all ' + total + ' protocols counted, first match wins</p>' +
+      '<div class="ledger-bar" role="img" aria-label="Ledger of ' + total + ' protocols in ten groups">' + segs + '</div>' +
+      '<p class="ledger-legend">' + legend + '</p>';
+  }
+  ledgerBar();
 
   /* ---------- filters ---------- */
   var catSel = document.getElementById('category');
@@ -228,9 +271,12 @@
     var html = '';
     rows.forEach(function (r) {
       var pct = maxImplied ? Math.max(2, Math.round(r.implied_value_usd / maxImplied * 100)) : 0;
+      var iv = (r.interval_low_usd !== undefined && r.interval_high_usd !== undefined)
+        ? '<span class="interval">P25–P75 ' + fmtCompact(r.interval_low_usd) + ' – ' + fmtCompact(r.interval_high_usd) + '</span>'
+        : '';
       html += '<tr data-slug="' + esc(r.slug) + '"><td>' + r.rank + '</td>' +
         '<td><span class="name">' + esc(r.name) + '</span><br><span class="sub">' + esc(r.category || 'Uncategorised') + ' · ' + esc((r.chains || []).join(', ') || '—') + '</span></td>' +
-        '<td class="num"><strong>' + fmtUSD(r.implied_value_usd) + '</strong><span class="bar"><i style="width:' + pct + '%"></i></span></td>' +
+        '<td class="num"><strong>' + fmtUSD(r.implied_value_usd) + '</strong>' + iv + '<span class="bar"><i style="width:' + pct + '%"></i></span></td>' +
         '<td class="num">' + fmtUSD(r.tvl_usd) + '</td>' +
         '<td class="num">' + fmtPct(r.change_7d) + '</td>' +
         '<td class="num">' + fmtAge(r.age_days) + '</td>' +
@@ -268,14 +314,17 @@
     var recomputed = impliedOf(row);
     var agrees = recomputed === row.implied_value_usd;
     var compNote = row.comparable_source === 'category'
-      ? 'median mcap/TVL of ' + row.comparables_used + ' tokened ' + (row.category || '') + ' protocols'
-      : 'global median (fewer than 3 tokened comparables in ' + (row.category || 'this category') + ')';
+      ? 'geometric mean mcap/TVL of ' + row.comparables_used + ' tokened ' + (row.category || '') + ' protocols, shrunk toward the global geometric mean (α = 0.5)'
+      : 'global geometric mean (fewer than 10 tokened comparables in ' + (row.category || 'this category') + ')';
     var steps = buildFarmPlan(row).map(function (s) {
       return '<li>' + esc(s.text) + ' <span class="cost">Cost: ' + esc(s.cost) + '. Time: ' + esc(s.time) + '.</span></li>';
     }).join('');
     var be = row.break_even;
     var beText = be
       ? '<p><strong>Break-even.</strong> This plan spends about $' + be.gas_usd.toFixed(2) + ' in gas (one setup transaction, one a week for ' + be.weeks + ' weeks, and the claim) over ' + be.active_hours.toFixed(2) + ' active hours — so the allocation must be worth at least $' + be.usd_per_hour.toFixed(2) + ' per hour of your time to cover its cost. The capital stays in the position, so it is not counted as a cost.</p>'
+      : '';
+    var ivRow = (row.interval_low_usd !== undefined && row.interval_high_usd !== undefined)
+      ? '<tr><td>P25–P75 range</td><td>' + fmtUSD(row.interval_low_usd) + ' – ' + fmtUSD(row.interval_high_usd) + '</td></tr>'
       : '';
     dialog.innerHTML = '<div class="detail"><button class="close" type="button" aria-label="Close">Close ×</button>' +
       '<h2>' + esc(row.name) + '</h2>' +
@@ -287,6 +336,7 @@
       '<tr><td>Momentum factor (7-day ' + (row.change_7d === null ? 'not reported' : row.change_7d.toFixed(1) + '%') + ')</td><td>× ' + row.momentum_factor.toFixed(2) + '</td></tr>' +
       '<tr><td>Maturity factor (' + (row.age_days === null ? 'age not reported, median ' + D.median_age_days + ' days' : fmtAge(row.age_days) + ' with no token') + ')</td><td>× ' + row.maturity_factor.toFixed(2) + '</td></tr>' +
       '<tr class="total"><td>Implied launch value</td><td>' + fmtUSD(row.implied_value_usd) + '</td></tr>' +
+      ivRow +
       '<tr><td>Recomputed by this page</td><td>' + fmtUSD(recomputed) + (agrees ? ' — matches the board' : ' — differs from the board') + '</td></tr>' +
       '</tbody></table>' +
       '<h3>Farm plan — ' + esc(row.verdict) + '</h3>' +
