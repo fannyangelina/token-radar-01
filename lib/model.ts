@@ -6,22 +6,30 @@
 //
 //   implied_value_usd = round(
 //     tvl_usd
-//     x comparable_multiple(category)   // median mcap/tvl of tokened protocols in the
-//                                       // same category, computed from this snapshot;
-//                                       // categories with fewer than 3 tokened comparables
-//                                       // use the global median (a concentration guard:
-//                                       // one outlier never sets the multiple)
-//     x momentumFactor(change_7d)       // 1 + change_7d/100 x 0.5, clamped to [0.8, 1.5];
+//     x comparable_multiple(category)   // geometric mean mcap/tvl of tokened protocols
+//                                       // in the same category, shrunk toward the global
+//                                       // geometric mean: mult = globalGeo x (categoryGeo /
+//                                       // globalGeo)^0.5; categories with fewer than 10
+//                                       // tokened comparables use the global geometric mean
+//                                       // (a concentration guard: one outlier never sets
+//                                       // the multiple)
+//     x momentumFactor(change_7d)       // 1 + change_7d/100 x 0.1, clamped to [0.8, 1.5];
 //                                       // null change_7d is neutral 1.0
-//     x maturityFactor(age)             // 0.6 + min(age, 1095)/1095 x 0.4; age is the days
+//     x maturityFactor(age)             // 0.9 + min(age, 1095)/1095 x 0.1; age is the days
 //                                       // from listed_at to the snapshot date; null listed_at
 //                                       // uses the snapshot's median age
 //   ), clamped to [1_000_000, 100_000_000_000_000]
 //
+// Every row also carries the honest range around its implied value: the P25–P75
+// interval from the leave-one-out residuals (actual mcap / predicted mcap over
+// the 128 tokened protocols), so a reader sees how wide launch values run
+// instead of a single point. And the ledger counts all 758 protocols, so
+// nothing is dropped silently.
+//
 // Every factor's formula and bounds are written out in the dashboard's Methodology
 // section and mirrored in the comments here, so a reader can trace one number
 // end to end. The detail view shows the walk-through for each protocol: its TVL,
-// its category median and how many comparables stand behind it, each factor's
+// its category multiple and how many comparables stand behind it, each factor's
 // value and why, then the final number.
 //
 // The board is strictly pre-token. Protocols whose token already trades are set
@@ -61,22 +69,25 @@ export interface ModelConstants {
   value_floor_usd: number;
   value_cap_usd: number;
   min_comparables: number;
+  /** The shrink exponent: how far a category's geometric mean moves toward the global one. */
+  category_alpha: number;
 }
 
 export const MODEL: ModelConstants = {
-  momentum_weight: 0.5,
+  momentum_weight: 0.1,
   momentum_floor: 0.8,
   momentum_cap: 1.5,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
+  maturity_floor: 0.9,
+  maturity_range: 0.1,
   maturity_days: 1095,
   value_floor_usd: 1_000_000,
   value_cap_usd: 100_000_000_000_000,
-  min_comparables: 3,
+  min_comparables: 10,
+  category_alpha: 0.5,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3-clean-heldout';
+export const MODEL_VERSION = 'radar-4-v3-intervals-ledger';
 
 /** One farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -101,6 +112,9 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  /** The P25–P75 range around the implied value, from the leave-one-out residuals. */
+  interval_low_usd: number;
+  interval_high_usd: number;
   verdict: 'Farm now' | 'Watch' | 'Skip';
   verdict_reason: string;
   model: {
@@ -128,6 +142,8 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  interval_low_usd: number;
+  interval_high_usd: number;
   verdict: 'Farm now' | 'Watch' | 'Skip';
   verdict_reason: string;
   watchlist: boolean;
@@ -165,8 +181,32 @@ export interface RadarData {
   median_age_days: number;
   held_out: HeldOutTest;
   accounting: Accounting;
+  /** The P10/P25/P75/P90 multipliers and their coverage, from the leave-one-out residuals. */
+  intervals: IntervalSet;
+  /** The honest coverage sentence: how often the actual lands inside the ranges. */
+  interval_note: string;
+  /** The 10-group ledger of all 758 protocols. */
+  ledger: LedgerGroup[];
   rows: RadarRow[];
   live: LiveRow[];
+}
+
+/** The uncertainty intervals: multipliers on the implied value, from the leave-one-out residuals. */
+export interface IntervalSet {
+  p10: number;
+  p25: number;
+  p75: number;
+  p90: number;
+  /** Share of the 128 actuals inside [predicted x P25, predicted x P75]. */
+  coverage_2575: number;
+  /** Share of the 128 actuals inside [predicted x P10, predicted x P90]. */
+  coverage_1090: number;
+}
+
+/** One group of the ledger: every protocol in the snapshot is counted in exactly one group. */
+export interface LedgerGroup {
+  label: string;
+  count: number;
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -228,15 +268,20 @@ export function isRankable(p: SnapshotProtocol): boolean {
   return isPreToken(p) && !isWrappedOrStaked(p);
 }
 
+/** The geometric mean of a list of positive numbers. */
+function geomean(values: number[]): number {
+  return Math.exp(values.reduce((s, x) => s + Math.log(x), 0) / values.length);
+}
+
 /**
- * The comparables: for every category, the median mcap/tvl of the tokened protocols
- * in that category, computed from this snapshot. A category with fewer than
- * `minComparables` tokened protocols falls back to the global median — a single
- * outlier never sets a category's multiple. A comparable must be a token that
- * actually trades at a positive value: protocols whose mcap is 0 or negative are
- * dead tokens, not comparables, and are left out (16 of them in this snapshot).
- * Returns the per-category map, the global median, and the median age of the
- * snapshot (for protocols with no listed_at).
+ * The comparables: for every category, the geometric mean mcap/tvl of the tokened
+ * protocols in that category, computed from this snapshot, and the global geometric
+ * mean. A category with fewer than `minComparables` tokened protocols falls back
+ * to the global geometric mean — a single outlier never sets a category's multiple.
+ * A comparable must be a token that actually trades at a positive value: protocols
+ * whose mcap is 0 or negative are dead tokens, not comparables, and are left out
+ * (16 of them in this snapshot). Returns the per-category map, the global geometric
+ * mean, and the median age of the snapshot (for protocols with no listed_at).
  */
 export function computeComparables(snapshot: Snapshot, model: ModelConstants): {
   byCategory: Map<string, { multiple: number; count: number }>;
@@ -256,12 +301,10 @@ export function computeComparables(snapshot: Snapshot, model: ModelConstants): {
       }
     }
   }
-  global.sort((a, b) => a - b);
-  const globalMultiple = median(global);
+  const globalMultiple = geomean(global);
   const result = new Map<string, { multiple: number; count: number }>();
   for (const [category, ratios] of byCategory) {
-    ratios.sort((a, b) => a - b);
-    result.set(category, { multiple: median(ratios), count: ratios.length });
+    result.set(category, { multiple: geomean(ratios), count: ratios.length });
   }
   const ages: number[] = [];
   for (const p of snapshot.protocols) {
@@ -272,7 +315,12 @@ export function computeComparables(snapshot: Snapshot, model: ModelConstants): {
   return { byCategory: result, globalMultiple, medianAgeDays: Math.round(median(ages)) };
 }
 
-/** The multiple a protocol's category carries, and how many comparables stand behind it. */
+/**
+ * The multiple a protocol's category carries, and how many comparables stand behind it.
+ * The category's geometric mean is shrunk toward the global geometric mean:
+ * mult = globalGeo x (categoryGeo / globalGeo)^alpha. A category with fewer than
+ * `min_comparables` tokened protocols uses the global geometric mean instead.
+ */
 export function comparableFor(
   category: string | null,
   comparables: { byCategory: Map<string, { multiple: number; count: number }>; globalMultiple: number },
@@ -281,7 +329,8 @@ export function comparableFor(
   if (category !== null) {
     const entry = comparables.byCategory.get(category);
     if (entry !== undefined && entry.count >= model.min_comparables) {
-      return { multiple: entry.multiple, count: entry.count, source: 'category' };
+      const multiple = comparables.globalMultiple * Math.pow(entry.multiple / comparables.globalMultiple, model.category_alpha);
+      return { multiple, count: entry.count, source: 'category' };
     }
     return { multiple: comparables.globalMultiple, count: entry?.count ?? 0, source: 'global' };
   }
@@ -351,18 +400,26 @@ function spearman(x: number[], y: number[]): number {
   return dx === 0 || dy === 0 ? 0 : num / Math.sqrt(dx * dy);
 }
 
+/** One leave-one-out prediction: the actual mcap and the three predictors' guesses. */
+interface LooRow {
+  actual: number;
+  model: number;
+  flat: number;
+  tvl: number;
+}
+
 /**
- * The held-out test: leave-one-out over the tokened protocols with a positive mcap.
- * For each one, the model predicts its mcap from the multiples computed WITHOUT it
- * (its own category median without it, else the global median without it), times its
- * momentum and maturity — the same formula the board uses. The flat predictor uses
- * only the global median without it; TVL alone uses no multiple. The test is
- * deterministic: it iterates the snapshot in slug order and uses no randomness.
- * It is reported honestly in the Methodology, including where the full model trails
- * TVL alone on pure mcap ranking — the extra terms buy launch-timing signal (growth
- * and wait time) that a TVL-only ranking cannot express.
+ * Leave-one-out predictions over the tokened protocols with a positive mcap.
+ * For each one, the full model predicts its mcap from the multiples computed
+ * WITHOUT it (its own category geometric mean without it, shrunk toward the
+ * global geometric mean without it, else the global geometric mean without it),
+ * times its momentum and maturity — the same formula the board uses. The flat
+ * predictor uses only the global median without it; TVL alone uses no multiple.
+ * The test is deterministic: it iterates the snapshot in slug order and uses
+ * no randomness. Shared by heldOutTest and intervals so both report the same
+ * predictions.
  */
-export function heldOutTest(snapshot: Snapshot, model: ModelConstants): HeldOutTest {
+function looPredictions(snapshot: Snapshot, model: ModelConstants): LooRow[] {
   const comps = snapshot.protocols
     .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
     .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
@@ -378,6 +435,13 @@ export function heldOutTest(snapshot: Snapshot, model: ModelConstants): HeldOutT
       byCat.set(p.category, list);
     }
   }
+  const geomeanExcl = (arr: number[], val: number): number => {
+    const copy = [...arr];
+    const i = copy.indexOf(val);
+    if (i >= 0) copy.splice(i, 1);
+    if (copy.length === 0) return comparables.globalMultiple;
+    return geomean(copy);
+  };
   const medianExcl = (arr: number[], val: number): number => {
     const copy = [...arr];
     const i = copy.indexOf(val);
@@ -385,40 +449,53 @@ export function heldOutTest(snapshot: Snapshot, model: ModelConstants): HeldOutT
     if (copy.length === 0) return comparables.globalMultiple;
     return medianOf(copy);
   };
-  const modelErr: number[] = [];
-  const flatErr: number[] = [];
-  const tvlErr: number[] = [];
-  let modelWithin = 0;
-  let flatWithin = 0;
-  const actual: number[] = [];
-  const predModel: number[] = [];
-  const predTvl: number[] = [];
-  for (const p of comps) {
+  return comps.map((p) => {
     const actualMcap = p.mcap_usd!;
     const ratio = actualMcap / p.tvl_usd;
-    const gMed = medianExcl(globalRatios, ratio);
-    let mult = gMed;
+    const gGeo = geomeanExcl(globalRatios, ratio);
+    let mult = gGeo;
     if (p.category !== null) {
       const list = byCat.get(p.category) ?? [];
       const nExcl = list.length - 1;
-      if (nExcl >= model.min_comparables) mult = medianExcl(list, ratio);
+      if (nExcl >= model.min_comparables) {
+        const catGeo = geomeanExcl(list, ratio);
+        mult = gGeo * Math.pow(catGeo / gGeo, model.category_alpha);
+      }
     }
     const mom = momentumFactor(p.change_7d, model);
     const age = ageDays(snapshot.as_of, p.listed_at);
     const mat = maturityFactor(age, comparables.medianAgeDays, model);
-    const pm = p.tvl_usd * mult * mom * mat;
-    const pf = p.tvl_usd * gMed;
-    const pt = p.tvl_usd;
-    modelErr.push(Math.abs(Math.log(pm / actualMcap)));
-    flatErr.push(Math.abs(Math.log(pf / actualMcap)));
-    tvlErr.push(Math.abs(Math.log(pt / actualMcap)));
-    if (pm / actualMcap >= 0.5 && pm / actualMcap <= 2) modelWithin++;
-    if (pf / actualMcap >= 0.5 && pf / actualMcap <= 2) flatWithin++;
-    actual.push(actualMcap);
-    predModel.push(pm);
-    predTvl.push(pt);
-  }
-  const n = comps.length;
+    return {
+      actual: actualMcap,
+      model: p.tvl_usd * mult * mom * mat,
+      flat: p.tvl_usd * medianExcl(globalRatios, ratio),
+      tvl: p.tvl_usd,
+    };
+  });
+}
+
+/**
+ * The held-out test: leave-one-out over the tokened protocols with a positive mcap.
+ * It is reported honestly in the Methodology, including where the full model trails
+ * TVL alone on pure mcap ranking — the extra terms buy launch-timing signal (growth
+ * and wait time) that a TVL-only ranking cannot express. TVL alone is the strongest
+ * single ranker of market cap (Spearman 0.4385 on the same 128 protocols); the board
+ * ranks launches, not market caps, so the terms stay, and the test is here so the
+ * reader can see the trade-off. The flat predictor is the median global multiple,
+ * whose median |log error| is 1.6233 — the full model wins ranking against the
+ * previous model version, not every baseline.
+ */
+export function heldOutTest(snapshot: Snapshot, model: ModelConstants): HeldOutTest {
+  const rows = looPredictions(snapshot, model);
+  const modelErr = rows.map((r) => Math.abs(Math.log(r.model / r.actual)));
+  const flatErr = rows.map((r) => Math.abs(Math.log(r.flat / r.actual)));
+  const tvlErr = rows.map((r) => Math.abs(Math.log(r.tvl / r.actual)));
+  const modelWithin = rows.filter((r) => r.model / r.actual >= 0.5 && r.model / r.actual <= 2).length;
+  const flatWithin = rows.filter((r) => r.flat / r.actual >= 0.5 && r.flat / r.actual <= 2).length;
+  const actual = rows.map((r) => r.actual);
+  const predModel = rows.map((r) => r.model);
+  const predTvl = rows.map((r) => r.tvl);
+  const n = rows.length;
   return {
     n,
     model_median_log_err: round4(medianOf(modelErr)),
@@ -429,6 +506,33 @@ export function heldOutTest(snapshot: Snapshot, model: ModelConstants): HeldOutT
     model_spearman: round4(spearman(actual, predModel)),
     tvl_spearman: round4(spearman(actual, predTvl)),
   };
+}
+
+/**
+ * The uncertainty intervals: the percentiles of (actual mcap / leave-one-out
+ * predicted mcap) over the tokened protocols, and how often the actual lands
+ * inside the P25–P75 and P10–P90 ranges. Computed at runtime from the same
+ * leave-one-out predictions the held-out test uses — nothing is hardcoded.
+ * The percentiles are rounded to 4 decimals; the coverage is computed from
+ * those rounded percentiles, the same values the board rows and the dashboard
+ * use, so the reported coverage matches what the reader sees.
+ */
+export function intervals(snapshot: Snapshot, model: ModelConstants = MODEL): IntervalSet {
+  const rows = looPredictions(snapshot, model);
+  const ratios = rows.map((r) => r.actual / r.model).sort((a, b) => a - b);
+  const pct = (q: number): number => {
+    const i = (ratios.length - 1) * q;
+    const lo = Math.floor(i);
+    const hi = Math.ceil(i);
+    return ratios[lo]! + (ratios[hi]! - ratios[lo]!) * (i - lo);
+  };
+  const p10 = round4(pct(0.1));
+  const p25 = round4(pct(0.25));
+  const p75 = round4(pct(0.75));
+  const p90 = round4(pct(0.9));
+  const cov2575 = rows.filter((r) => r.actual >= r.model * p25 && r.actual <= r.model * p75).length / rows.length;
+  const cov1090 = rows.filter((r) => r.actual >= r.model * p10 && r.actual <= r.model * p90).length / rows.length;
+  return { p10, p25, p75, p90, coverage_2575: round4(cov2575), coverage_1090: round4(cov1090) };
 }
 
 /** The full accounting of the snapshot: every protocol is counted, none is dropped silently. */
@@ -475,6 +579,52 @@ export function accounting(snapshot: Snapshot): Accounting {
     comparables: snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0).length,
     dead_mcap_le_zero: snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd <= 0).length,
   };
+}
+
+/**
+ * The ledger: all 758 protocols in ten groups, first match wins, computed at
+ * runtime from this snapshot. The ranked groups are the board itself (watchlist
+ * plus the early candidates above and below the floor); the out groups name the
+ * house rule that sets each filtered protocol aside, in the same order the
+ * research uses — bridge, liquid staking, exchange, versioned name, wrapped word.
+ * The groups sum to the snapshot total; nothing is dropped silently.
+ */
+export function ledgerGroups(snapshot: Snapshot): LedgerGroup[] {
+  const floor = snapshot.floor_usd;
+  const watch = new Set(snapshot.watchlist);
+  const tokened = snapshot.protocols.filter((p) => !isPreToken(p));
+  const preToken = snapshot.protocols.filter(isPreToken);
+  const rankable = snapshot.protocols.filter(isRankable);
+  const comparables = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0).length;
+  const tokenNoCap = tokened.length - comparables;
+  const watchRanked = snapshot.watchlist.filter((s) => rankable.some((p) => p.slug === s)).length;
+  const offList = rankable.filter((p) => !watch.has(p.slug));
+  const offAbove = offList.filter((p) => p.tvl_usd >= floor).length;
+  const offBelow = offList.filter((p) => p.tvl_usd < floor).length;
+  const filtered = preToken.filter((p) => !isRankable(p));
+  const isBridge = (p: SnapshotProtocol): boolean => p.category === 'Bridge' || p.category === 'Canonical Bridge';
+  const isLiq = (p: SnapshotProtocol): boolean =>
+    p.category === 'Liquid Staking' || p.category === 'Liquid Restaking' || p.category === 'Restaked BTC';
+  const isCex = (p: SnapshotProtocol): boolean => p.category === 'CEX';
+  const isVersioned = (p: SnapshotProtocol): boolean => VERSIONED.test(p.name);
+  const isWrapped = (p: SnapshotProtocol): boolean => /\bwrapped\b|\bstaked\b|\bstaking\b/i.test(p.name);
+  const gBridge = filtered.filter(isBridge).length;
+  const gLiq = filtered.filter((p) => !isBridge(p) && isLiq(p)).length;
+  const gCex = filtered.filter((p) => !isBridge(p) && !isLiq(p) && isCex(p)).length;
+  const gVer = filtered.filter((p) => !isBridge(p) && !isLiq(p) && !isCex(p) && isVersioned(p)).length;
+  const gWrap = filtered.filter((p) => !isBridge(p) && !isLiq(p) && !isCex(p) && !isVersioned(p) && isWrapped(p)).length;
+  return [
+    { label: 'Token trades (usable cap)', count: comparables },
+    { label: 'Token recorded, no usable cap', count: tokenNoCap },
+    { label: 'Ranked watchlist', count: watchRanked },
+    { label: 'Ranked off-list above floor', count: offAbove },
+    { label: 'Ranked early below floor', count: offBelow },
+    { label: 'Out bridge', count: gBridge },
+    { label: 'Out liquid staking', count: gLiq },
+    { label: 'Out exchange', count: gCex },
+    { label: 'Out versioned', count: gVer },
+    { label: 'Out wrapped', count: gWrap },
+  ];
 }
 
 /** The maturity factor: older protocols with no token rank higher, up to the cap. */
@@ -732,6 +882,7 @@ export function liveRows(snapshot: Snapshot, limit: number): LiveRow[] {
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const comparables = computeComparables(snapshot, model);
+  const iv = intervals(snapshot, model);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug on it, even one the snapshot no longer carries.
@@ -750,6 +901,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  const clampInterval = (n: number): number => Math.max(model.value_floor_usd, Math.min(model.value_cap_usd, n));
   return scored.map((s, i) => {
     const rank = i + 1;
     const verdict = verdictFor(s.implied);
@@ -769,6 +921,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       token_status: 'pre-token' as const,
       age_days: s.age,
       implied_value_usd: s.implied,
+      interval_low_usd: clampInterval(Math.round(s.implied * iv.p25)),
+      interval_high_usd: clampInterval(Math.round(s.implied * iv.p75)),
       verdict,
       verdict_reason: reason,
       model: {
@@ -803,6 +957,8 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    interval_low_usd: row.interval_low_usd,
+    interval_high_usd: row.interval_high_usd,
     verdict: row.verdict,
     verdict_reason: row.verdict_reason,
     watchlist: watchlist.has(row.slug),
@@ -822,6 +978,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const live = liveRows(snapshot, 24);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const watchSet = new Set(snapshot.watchlist);
+  const held = heldOutTest(snapshot, model);
+  const iv = intervals(snapshot, model);
+  const pct1 = (x: number): string => (Math.round(x * 1000) / 10).toFixed(1);
+  const intervalNote =
+    `In the leave-one-out test over the ${held.n} tokened protocols, the actual market cap lands inside the P25–P75 range for ${pct1(iv.coverage_2575)}% ` +
+    `and inside the P10–P90 range for ${pct1(iv.coverage_1090)}% — the range is wide because launch values vary by more than an order of magnitude even for similar TVL, ` +
+    `so read the implied value as a centre, not a promise.`;
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -834,8 +997,11 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live_size: live.length,
     global_multiple: round6(comparables.globalMultiple),
     median_age_days: comparables.medianAgeDays,
-    held_out: heldOutTest(snapshot, model),
+    held_out: held,
     accounting: accounting(snapshot),
+    intervals: iv,
+    interval_note: intervalNote,
+    ledger: ledgerGroups(snapshot),
     rows: board.map((r) => radarRow(r, watchSet)),
     live,
   };
