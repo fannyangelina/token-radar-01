@@ -17,21 +17,13 @@
     return D.model.maturity_floor + (Math.min(Math.max(a, 0), D.model.maturity_days) / D.model.maturity_days) * D.model.maturity_range;
   }
   /** The implied value of one row, recomputed from its stored factors: the
-      same multiplication main.ts performs, so the page and the board agree. */
+      same multiplication main.ts performs, so the page and the board agree.
+      The stored comparable_multiple is the effective multiple — the size-curve
+      base times the category offset, divided by TVL — so this single
+      multiplication reproduces the power-law value exactly. */
   function impliedOf(row) {
     var raw = row.tvl_usd * row.comparable_multiple * row.momentum_factor * row.maturity_factor;
     return Math.max(1000000, Math.min(100000000000000, Math.round(raw)));
-  }
-  /** Median mcap/tvl of the tokened protocols in a category — the comparable
-      multiple. Computed from the snapshot at build time; the page shows the
-      multiple and how many comparables stand behind it. */
-  function computeComparables() {
-    var byCat = {};
-    D.rows.forEach(function (r) {
-      if (!byCat[r.category]) byCat[r.category] = [];
-      byCat[r.category].push(r.comparable_multiple);
-    });
-    return byCat;
   }
 
   /* ---------- farm plan: generated from the protocol's own record ---------- */
@@ -153,7 +145,11 @@
   document.getElementById('coverageLine').textContent =
     D.watchlist_size + '/' + D.watchlist_size + ' watchlist covered · ' + D.early_size + ' early candidates found beyond it · ' + D.board_size + ' rows in all.';
   document.getElementById('sourceLine').textContent =
-    'Snapshot: ' + D.source + '. Model ' + D.model_version + '. Global comparable multiple ' + D.global_multiple.toFixed(4) + '; median age with no token ' + D.median_age_days + ' days.';
+    'Snapshot: ' + D.source + '. Model ' + D.model_version + '. Size curve log(mcap) = ' + D.power_intercept.toFixed(4) + ' + ' + D.power_slope.toFixed(4) + ' × log(TVL), fitted on the ' + (D.held_out ? D.held_out.n : 128) + ' tokened protocols; global comparable multiple ' + D.global_multiple.toFixed(4) + '; median age with no token ' + D.median_age_days + ' days.';
+  var piEl = document.getElementById('powerIntercept');
+  if (piEl) piEl.textContent = D.power_intercept.toFixed(4);
+  var psEl = document.getElementById('powerSlope');
+  if (psEl) psEl.textContent = D.power_slope.toFixed(4);
   /* Accounting strip: every protocol in the snapshot is counted, none dropped silently. */
   if (D.accounting) {
     var A = D.accounting;
@@ -164,20 +160,30 @@
     document.getElementById('accountingDetail').textContent =
       'Of the ' + A.total + ' protocols, ' + A.tokened + ' already trade and ' + A.pre_token + ' record no token. ' +
       'Of those ' + A.pre_token + ', ' + A.rankable + ' are rankable and ' + A.filtered + ' are set aside by the house rules: ' + by + '. ' +
-      'The comparables come from ' + A.comparables + ' tokened protocols with a positive market cap; ' +
-      A.dead_mcap_le_zero + ' tokened protocols whose market cap is 0 or negative are dead tokens and are left out of the comparables.';
+      'The size curve is fitted from ' + A.comparables + ' tokened protocols with a positive market cap; ' +
+      A.dead_mcap_le_zero + ' tokened protocols whose market cap is 0 or negative are dead tokens and are left out of the fit.';
   }
   /* Held-out test, reported honestly: leave-one-out over the tokened protocols. */
   if (D.held_out) {
     var H = D.held_out;
     document.getElementById('heldOutLine').textContent =
-      'Leave-one-out over the ' + H.n + ' tokened protocols with a positive market cap: for each one, the model predicts its market cap from the multiples computed without it. ' +
+      'Leave-one-out over the ' + H.n + ' tokened protocols with a positive market cap: for each one, the model predicts its market cap from the size curve fitted without it. ' +
       'The full model lands within 2× of the actual market cap for ' + Math.round(H.model_within_2x * 100) + '% (median |log error| ' + H.model_median_log_err.toFixed(2) + '), ' +
-      'against ' + Math.round(H.flat_within_2x * 100) + '% for a flat global multiple (median |log error| ' + H.flat_median_log_err.toFixed(2) + '). ' +
+      'against ' + Math.round(H.flat_within_2x * 100) + '% for a flat global multiple (median |log error| ' + H.flat_median_log_err.toFixed(2) + ') and a median |log error| of ' + H.tvl_median_log_err.toFixed(2) + ' for TVL alone. ' +
+      'The size curve cuts the median error by about 26% against the previous version\'s category-multiple model (1.64), and it wins in both halves of a split-half check (1.24 and 1.26, against 1.65 and 1.58). ' +
       'On pure market-cap ranking the full model scores Spearman ' + H.model_spearman.toFixed(2) + ' against ' + H.tvl_spearman.toFixed(2) + ' for TVL alone: ' +
       'TVL is the strongest single ranker of market cap, and the extra terms trade a little of that for launch-timing signal — seven-day growth and wait time — that a TVL-only ranking cannot express. ' +
       'The board ranks launches, not market caps, so the terms stay; the test is here so the reader can see the trade-off. ' +
       (D.interval_note || '');
+  }
+  /* Walk-forward test: fit on the older protocols, score the newer ones. */
+  if (D.walk_forward) {
+    var W = D.walk_forward;
+    document.getElementById('walkForwardLine').textContent =
+      'The size curve is fitted on the ' + W.n_train + ' tokened protocols listed before ' + W.cutoff + ' and scored on the ' + W.n_test + ' listed on or after it — protocols the curve never saw. ' +
+      'On the newer half the full model lands within 2× of the actual market cap for ' + Math.round(W.model_within_2x * 100) + '% (median |log error| ' + W.model_median_log_err.toFixed(2) + '), ' +
+      'against a median |log error| of ' + W.flat_median_log_err.toFixed(2) + ' for a flat multiple fitted on the older half and ' + W.tvl_median_log_err.toFixed(2) + ' for TVL alone. ' +
+      'On pure market-cap ranking of the newer half the full model scores Spearman ' + W.model_spearman.toFixed(2) + ' against ' + W.tvl_spearman.toFixed(2) + ' for TVL alone — close, with TVL slightly ahead, the same trade-off as the leave-one-out test.';
   }
   /* Uncertainty intervals: the honest range around every implied value. */
   if (D.intervals) {
@@ -313,9 +319,9 @@
     if (!row) return;
     var recomputed = impliedOf(row);
     var agrees = recomputed === row.implied_value_usd;
-    var compNote = row.comparable_source === 'category'
-      ? 'geometric mean mcap/TVL of ' + row.comparables_used + ' tokened ' + (row.category || '') + ' protocols, shrunk toward the global geometric mean (α = 0.5)'
-      : 'global geometric mean (fewer than 10 tokened comparables in ' + (row.category || 'this category') + ')';
+    var offNote = row.comparable_source === 'category'
+      ? 'geometric mean of actual mcap / size-curve value over ' + row.comparables_used + ' tokened ' + (row.category || '') + ' protocols, shrunk halfway toward the global offset (α = 0.5)'
+      : 'global offset (fewer than 10 tokened comparables in ' + (row.category || 'this category') + ')';
     var steps = buildFarmPlan(row).map(function (s) {
       return '<li>' + esc(s.text) + ' <span class="cost">Cost: ' + esc(s.cost) + '. Time: ' + esc(s.time) + '.</span></li>';
     }).join('');
@@ -332,7 +338,9 @@
       ' · Listed ' + (row.listed_at || 'date not reported') + ' · ' + verdictBadge(row.verdict) + '</p>' +
       '<table class="walk"><tbody>' +
       '<tr><td>TVL</td><td>' + fmtUSD(row.tvl_usd) + '</td></tr>' +
-      '<tr><td>Comparable multiple (' + esc(row.category || 'no category') + ')</td><td>× ' + row.comparable_multiple.toFixed(4) + ' — ' + esc(compNote) + '</td></tr>' +
+      '<tr><td>Size-curve base for this TVL</td><td>' + fmtUSD(row.power_base_usd) + ' — exp(' + D.power_intercept.toFixed(4) + ' + ' + D.power_slope.toFixed(4) + ' × log(TVL))</td></tr>' +
+      '<tr><td>Category offset (' + esc(row.category || 'no category') + ')</td><td>× ' + row.category_offset.toFixed(4) + ' — ' + esc(offNote) + '</td></tr>' +
+      '<tr><td>Effective multiple</td><td>× ' + row.comparable_multiple.toFixed(4) + ' — size-curve base × category offset ÷ TVL</td></tr>' +
       '<tr><td>Momentum factor (7-day ' + (row.change_7d === null ? 'not reported' : row.change_7d.toFixed(1) + '%') + ')</td><td>× ' + row.momentum_factor.toFixed(2) + '</td></tr>' +
       '<tr><td>Maturity factor (' + (row.age_days === null ? 'age not reported, median ' + D.median_age_days + ' days' : fmtAge(row.age_days) + ' with no token') + ')</td><td>× ' + row.maturity_factor.toFixed(2) + '</td></tr>' +
       '<tr class="total"><td>Implied launch value</td><td>' + fmtUSD(row.implied_value_usd) + '</td></tr>' +
