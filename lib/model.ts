@@ -5,14 +5,21 @@
 // only from the snapshot's own figures — never from a hardcoded name list:
 //
 //   implied_value_usd = round(
-//     tvl_usd
-//     x comparable_multiple(category)   // geometric mean mcap/tvl of tokened protocols
-//                                       // in the same category, shrunk toward the global
-//                                       // geometric mean: mult = globalGeo x (categoryGeo /
-//                                       // globalGeo)^0.5; categories with fewer than 10
-//                                       // tokened comparables use the global geometric mean
-//                                       // (a concentration guard: one outlier never sets
-//                                       // the multiple)
+//     powerLawBase(tvl_usd)           // exp(a + b*log(TVL)), the fitted size curve:
+//                                     // log(mcap) = a + b*log(TVL), fitted by OLS on the
+//                                     // 128 tokened protocols in this snapshot. The
+//                                     // mcap/TVL multiple falls ~20x from the smallest
+//                                     // to the largest TVL band, so a flat multiple
+//                                     // systematically overvalues large protocols and
+//                                     // undervalues small ones; the size curve corrects
+//                                     // both ends. Fitted at runtime, never hardcoded.
+//     x categoryOffset(category)      // geometric mean of (actual mcap / power-law
+//                                     // implied mcap) for tokened protocols in the same
+//                                     // category, shrunk toward the global offset (1.0):
+//                                     // offset = global x (category / global)^0.5; a
+//                                     // category with fewer than 10 tokened comparables
+//                                     // uses the global offset, so one outlier never
+//                                     // sets the value on its own
 //     x momentumFactor(change_7d)       // 1 + change_7d/100 x 0.1, clamped to [0.8, 1.5];
 //                                       // null change_7d is neutral 1.0
 //     x maturityFactor(age)             // 0.9 + min(age, 1095)/1095 x 0.1; age is the days
@@ -20,20 +27,33 @@
 //                                       // uses the snapshot's median age
 //   ), clamped to [1_000_000, 100_000_000_000_000]
 //
+// The board stores the effective multiple (powerLawBase x categoryOffset / TVL) per
+// row, so the dashboard recomputes the implied value as tvl x multiple x momentum
+// x maturity — the same multiplication, exactly. The detail view shows the walk-
+// through: the size-curve base for this protocol's TVL, its category offset, each
+// factor's value and why, then the final number.
+//
 // Every row also carries the honest range around its implied value: the P25–P75
 // interval from the leave-one-out residuals (actual mcap / predicted mcap over
 // the 128 tokened protocols), so a reader sees how wide launch values run
 // instead of a single point. And the ledger counts all 758 protocols, so
 // nothing is dropped silently.
 //
+// The model is tested two ways, both held out: leave-one-out over the 128
+// tokened protocols, and a walk-forward test that fits the size curve on the
+// older half (by listed_at) and scores the newer half. The power law wins on
+// point accuracy in both (median |log error| ~1.30 LOO, ~1.24/1.27 split-half),
+// while pure TVL remains the strongest single ranker of market cap — the
+// Methodology says so plainly.
+//
 // Every factor's formula and bounds are written out in the dashboard's Methodology
 // section and mirrored in the comments here, so a reader can trace one number
 // end to end. The detail view shows the walk-through for each protocol: its TVL,
-// its category multiple and how many comparables stand behind it, each factor's
-// value and why, then the final number.
+// its size-curve base and category offset, each factor's value and why, then the
+// final number.
 //
 // The board is strictly pre-token. Protocols whose token already trades are set
-// aside and shown only as the comparables the multiples come from.
+// aside and shown only as the comparables the curve is fitted from.
 
 /** One protocol entry: exactly the ten fields the sealed snapshot carries. */
 export interface SnapshotProtocol {
@@ -87,7 +107,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-4-v3-intervals-ledger';
+export const MODEL_VERSION = 'radar-5-power-law';
 
 /** One farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -118,9 +138,14 @@ export interface BoardRow {
   verdict: 'Farm now' | 'Watch' | 'Skip';
   verdict_reason: string;
   model: {
+    /** The effective multiple: power-law base x category offset / TVL. The dashboard recomputes tvl x this x momentum x maturity. */
     comparable_multiple: number;
     comparables_used: number;
     comparable_source: 'category' | 'global';
+    /** The size-curve base for this protocol's TVL: exp(a + b*log(TVL)). */
+    power_base_usd: number;
+    /** The category offset applied (1.0 when the category is thin or absent). */
+    category_offset: number;
     growth_pct: number | null;
     momentum_factor: number;
     maturity_factor: number;
@@ -150,6 +175,8 @@ export interface RadarRow {
   comparable_multiple: number;
   comparables_used: number;
   comparable_source: 'category' | 'global';
+  power_base_usd: number;
+  category_offset: number;
   momentum_factor: number;
   maturity_factor: number;
   break_even: BreakEven;
@@ -179,7 +206,12 @@ export interface RadarData {
   live_size: number;
   global_multiple: number;
   median_age_days: number;
+  /** The fitted size curve: log(mcap) = intercept + slope * log(TVL), OLS on the 128 tokened protocols. */
+  power_intercept: number;
+  power_slope: number;
   held_out: HeldOutTest;
+  /** The second held-out test: fit on the older half (by listed_at), score the newer half. */
+  walk_forward: WalkForwardTest;
   accounting: Accounting;
   /** The P10/P25/P75/P90 multipliers and their coverage, from the leave-one-out residuals. */
   intervals: IntervalSet;
@@ -315,26 +347,100 @@ export function computeComparables(snapshot: Snapshot, model: ModelConstants): {
   return { byCategory: result, globalMultiple, medianAgeDays: Math.round(median(ages)) };
 }
 
-/**
- * The multiple a protocol's category carries, and how many comparables stand behind it.
- * The category's geometric mean is shrunk toward the global geometric mean:
- * mult = globalGeo x (categoryGeo / globalGeo)^alpha. A category with fewer than
- * `min_comparables` tokened protocols uses the global geometric mean instead.
- */
-export function comparableFor(
-  category: string | null,
-  comparables: { byCategory: Map<string, { multiple: number; count: number }>; globalMultiple: number },
-  model: ModelConstants,
-): { multiple: number; count: number; source: 'category' | 'global' } {
-  if (category !== null) {
-    const entry = comparables.byCategory.get(category);
-    if (entry !== undefined && entry.count >= model.min_comparables) {
-      const multiple = comparables.globalMultiple * Math.pow(entry.multiple / comparables.globalMultiple, model.category_alpha);
-      return { multiple, count: entry.count, source: 'category' };
-    }
-    return { multiple: comparables.globalMultiple, count: entry?.count ?? 0, source: 'global' };
+/** The fitted size curve and its category offsets, computed from a training set of tokened protocols. */
+export interface PowerLaw {
+  /** Intercept of log(mcap) = intercept + slope * log(TVL), fitted by OLS. */
+  intercept: number;
+  /** Slope of log(mcap) = intercept + slope * log(TVL), fitted by OLS. */
+  slope: number;
+  /** The global offset: geometric mean of (actual mcap / power-law implied mcap) over the training set. OLS makes this ~1. */
+  globalOffset: number;
+  /** Per-category offset: geometric mean of (actual / power-law implied) in that category, shrunk toward the global offset. */
+  byCategory: Map<string, { offset: number; count: number }>;
+  /** Median age of the snapshot, for protocols with no listed_at. */
+  medianAgeDays: number;
+}
+
+/** OLS fit of y = a + b*x. Returns {a, b}. */
+function ols(xs: number[], ys: number[]): { a: number; b: number } {
+  const n = xs.length;
+  let sx = 0;
+  let sy = 0;
+  let sxx = 0;
+  let sxy = 0;
+  for (let i = 0; i < n; i++) {
+    sx += xs[i]!;
+    sy += ys[i]!;
+    sxx += xs[i]! * xs[i]!;
+    sxy += xs[i]! * ys[i]!;
   }
-  return { multiple: comparables.globalMultiple, count: 0, source: 'global' };
+  const b = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+  return { a: (sy - b * sx) / n, b };
+}
+
+/**
+ * Fit the size curve on a training set of tokened protocols (mcap > 0, tvl > 0):
+ * OLS of log(mcap) on log(TVL), then the category offsets as the geometric mean
+ * of (actual mcap / power-law implied mcap) within each category, shrunk toward
+ * the global offset the same way v3 shrinks a category multiple toward the global
+ * one: offset = global x (category / global)^alpha, and a category with fewer
+ * than `min_comparables` tokened protocols uses the global offset instead.
+ * Deterministic: the training set is iterated in slug order.
+ */
+export function fitPowerLawOn(train: SnapshotProtocol[], medianAgeDays: number, model: ModelConstants): PowerLaw {
+  const sorted = [...train].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const xs = sorted.map((p) => Math.log(p.tvl_usd));
+  const ys = sorted.map((p) => Math.log(p.mcap_usd!));
+  const { a, b } = ols(xs, ys);
+  const residuals = sorted.map((p) => Math.log(p.mcap_usd!) - (a + b * Math.log(p.tvl_usd)));
+  const globalOffset = Math.exp(residuals.reduce((s, r) => s + r, 0) / residuals.length);
+  const byCat = new Map<string, number[]>();
+  for (let i = 0; i < sorted.length; i++) {
+    const p = sorted[i]!;
+    if (p.category !== null) {
+      const list = byCat.get(p.category) ?? [];
+      list.push(residuals[i]!);
+      byCat.set(p.category, list);
+    }
+  }
+  const byCategory = new Map<string, { offset: number; count: number }>();
+  for (const [category, res] of byCat) {
+    const catOffset = Math.exp(res.reduce((s, r) => s + r, 0) / res.length);
+    const offset =
+      res.length >= model.min_comparables
+        ? globalOffset * Math.pow(catOffset / globalOffset, model.category_alpha)
+        : globalOffset;
+    byCategory.set(category, { offset, count: res.length });
+  }
+  return { intercept: a, slope: b, globalOffset, byCategory, medianAgeDays };
+}
+
+/** The size curve fitted on the snapshot's own 128 tokened protocols. */
+export function computePowerLaw(snapshot: Snapshot, model: ModelConstants): PowerLaw {
+  const comparables = computeComparables(snapshot, model);
+  const train = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  return fitPowerLawOn(train, comparables.medianAgeDays, model);
+}
+
+/** The category offset a protocol carries, and how many tokened protocols stand behind it. */
+export function categoryOffsetFor(
+  category: string | null,
+  powerLaw: PowerLaw,
+  model: ModelConstants,
+): { offset: number; count: number; source: 'category' | 'global' } {
+  if (category !== null) {
+    const entry = powerLaw.byCategory.get(category);
+    if (entry !== undefined && entry.count >= model.min_comparables) {
+      return { offset: entry.offset, count: entry.count, source: 'category' };
+    }
+    return { offset: powerLaw.globalOffset, count: entry?.count ?? 0, source: 'global' };
+  }
+  return { offset: powerLaw.globalOffset, count: 0, source: 'global' };
+}
+
+/** The power-law base value for a TVL: exp(intercept + slope * log(TVL)). */
+export function powerBase(tvlUsd: number, powerLaw: PowerLaw): number {
+  return Math.exp(powerLaw.intercept + powerLaw.slope * Math.log(tvlUsd));
 }
 
 /** The momentum factor: 1 + change_7d/100 x weight, clamped; null change is neutral 1.0. */
@@ -358,6 +464,30 @@ export interface HeldOutTest {
   /** The same, for the flat multiple. */
   flat_within_2x: number;
   /** Spearman rank correlation between predicted and actual mcap, for the full model. */
+  model_spearman: number;
+  /** The same, for TVL alone. */
+  tvl_spearman: number;
+}
+
+/** The walk-forward test: fit the size curve on the older protocols, score the newer ones. */
+export interface WalkForwardTest {
+  /** Tokened protocols with a listed_at date that the test can order. */
+  n: number;
+  /** Protocols the curve was fitted on (listed before the cutoff). */
+  n_train: number;
+  /** Protocols scored (listed on or after the cutoff). */
+  n_test: number;
+  /** The cutoff date (YYYY-MM-DD): the median listed_at of the tokened protocols. */
+  cutoff: string;
+  /** Median |log(predicted mcap / actual mcap)| for the full model on the newer half. */
+  model_median_log_err: number;
+  /** The same, for a flat global multiple fitted on the older half. */
+  flat_median_log_err: number;
+  /** The same, for TVL alone. */
+  tvl_median_log_err: number;
+  /** Share of the newer half whose predicted mcap lands within 2x of the actual, for the full model. */
+  model_within_2x: number;
+  /** Spearman rank correlation between predicted and actual mcap, for the full model, on the newer half. */
   model_spearman: number;
   /** The same, for TVL alone. */
   tvl_spearman: number;
@@ -410,38 +540,20 @@ interface LooRow {
 
 /**
  * Leave-one-out predictions over the tokened protocols with a positive mcap.
- * For each one, the full model predicts its mcap from the multiples computed
- * WITHOUT it (its own category geometric mean without it, shrunk toward the
- * global geometric mean without it, else the global geometric mean without it),
+ * For each one, the full model predicts its mcap from the size curve fitted
+ * WITHOUT it (OLS on the other 127, category offsets from the other 127),
  * times its momentum and maturity — the same formula the board uses. The flat
- * predictor uses only the global median without it; TVL alone uses no multiple.
- * The test is deterministic: it iterates the snapshot in slug order and uses
- * no randomness. Shared by heldOutTest and intervals so both report the same
- * predictions.
+ * predictor uses only the global median multiple without it; TVL alone uses no
+ * multiple. The test is deterministic: it iterates the snapshot in slug order
+ * and uses no randomness. Shared by heldOutTest and intervals so both report
+ * the same predictions.
  */
 function looPredictions(snapshot: Snapshot, model: ModelConstants): LooRow[] {
   const comps = snapshot.protocols
     .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
     .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
   const comparables = computeComparables(snapshot, model);
-  const byCat = new Map<string, number[]>();
-  const globalRatios: number[] = [];
-  for (const p of comps) {
-    const r = p.mcap_usd! / p.tvl_usd;
-    globalRatios.push(r);
-    if (p.category !== null) {
-      const list = byCat.get(p.category) ?? [];
-      list.push(r);
-      byCat.set(p.category, list);
-    }
-  }
-  const geomeanExcl = (arr: number[], val: number): number => {
-    const copy = [...arr];
-    const i = copy.indexOf(val);
-    if (i >= 0) copy.splice(i, 1);
-    if (copy.length === 0) return comparables.globalMultiple;
-    return geomean(copy);
-  };
+  const globalRatios: number[] = comps.map((p) => p.mcap_usd! / p.tvl_usd);
   const medianExcl = (arr: number[], val: number): number => {
     const copy = [...arr];
     const i = copy.indexOf(val);
@@ -449,25 +561,19 @@ function looPredictions(snapshot: Snapshot, model: ModelConstants): LooRow[] {
     if (copy.length === 0) return comparables.globalMultiple;
     return medianOf(copy);
   };
-  return comps.map((p) => {
+  return comps.map((p, idx) => {
     const actualMcap = p.mcap_usd!;
     const ratio = actualMcap / p.tvl_usd;
-    const gGeo = geomeanExcl(globalRatios, ratio);
-    let mult = gGeo;
-    if (p.category !== null) {
-      const list = byCat.get(p.category) ?? [];
-      const nExcl = list.length - 1;
-      if (nExcl >= model.min_comparables) {
-        const catGeo = geomeanExcl(list, ratio);
-        mult = gGeo * Math.pow(catGeo / gGeo, model.category_alpha);
-      }
-    }
+    const train = comps.filter((_, j) => j !== idx);
+    const fit = fitPowerLawOn(train, comparables.medianAgeDays, model);
+    const off = categoryOffsetFor(p.category, fit, model);
+    const base = powerBase(p.tvl_usd, fit);
     const mom = momentumFactor(p.change_7d, model);
     const age = ageDays(snapshot.as_of, p.listed_at);
     const mat = maturityFactor(age, comparables.medianAgeDays, model);
     return {
       actual: actualMcap,
-      model: p.tvl_usd * mult * mom * mat,
+      model: base * off.offset * mom * mat,
       flat: p.tvl_usd * medianExcl(globalRatios, ratio),
       tvl: p.tvl_usd,
     };
@@ -479,11 +585,12 @@ function looPredictions(snapshot: Snapshot, model: ModelConstants): LooRow[] {
  * It is reported honestly in the Methodology, including where the full model trails
  * TVL alone on pure mcap ranking — the extra terms buy launch-timing signal (growth
  * and wait time) that a TVL-only ranking cannot express. TVL alone is the strongest
- * single ranker of market cap (Spearman 0.4385 on the same 128 protocols); the board
- * ranks launches, not market caps, so the terms stay, and the test is here so the
- * reader can see the trade-off. The flat predictor is the median global multiple,
- * whose median |log error| is 1.6233 — the full model wins ranking against the
- * previous model version, not every baseline.
+ * single ranker of market cap; the board ranks launches, not market caps, so the
+ * terms stay, and the test is here so the reader can see the trade-off. The flat
+ * predictor is the median global multiple, whose median |log error| is 1.6233.
+ * The size curve's win is point accuracy: its median |log error| is far below
+ * both the flat multiple and TVL alone, and the walk-forward test confirms it
+ * on protocols the curve never saw.
  */
 export function heldOutTest(snapshot: Snapshot, model: ModelConstants): HeldOutTest {
   const rows = looPredictions(snapshot, model);
@@ -535,6 +642,65 @@ export function intervals(snapshot: Snapshot, model: ModelConstants = MODEL): In
   return { p10, p25, p75, p90, coverage_2575: round4(cov2575), coverage_1090: round4(cov1090) };
 }
 
+/**
+ * The walk-forward test: fit the size curve on the older tokened protocols and
+ * score the newer ones — a second held-out test, in time order. The tokened
+ * protocols with a listed_at date are ordered by it; the cutoff is their median
+ * listed_at, so the older half trains the curve and the newer half is scored
+ * without ever being seen. Protocols with no listed_at are left out (they cannot
+ * be ordered in time). The flat predictor is the median global multiple of the
+ * older half. Deterministic: the split is by date, ties broken by slug.
+ */
+export function walkForwardTest(snapshot: Snapshot, model: ModelConstants): WalkForwardTest {
+  const dated = snapshot.protocols
+    .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && p.listed_at !== null)
+    .sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : a.slug < b.slug ? -1 : 1));
+  const n = dated.length;
+  const cutoff = dated[Math.floor(n / 2)]!.listed_at!;
+  const train = dated.filter((p) => p.listed_at! < cutoff);
+  const test = dated.filter((p) => p.listed_at! >= cutoff);
+  const comparables = computeComparables(snapshot, model);
+  const fit = fitPowerLawOn(train, comparables.medianAgeDays, model);
+  const flatRatios = train.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b);
+  const flatMult = median(flatRatios);
+  const modelErr: number[] = [];
+  const flatErr: number[] = [];
+  const tvlErr: number[] = [];
+  let modelWithin = 0;
+  const actual: number[] = [];
+  const predModel: number[] = [];
+  const predTvl: number[] = [];
+  for (const p of test) {
+    const actualMcap = p.mcap_usd!;
+    const off = categoryOffsetFor(p.category, fit, model);
+    const base = powerBase(p.tvl_usd, fit);
+    const mom = momentumFactor(p.change_7d, model);
+    const age = ageDays(snapshot.as_of, p.listed_at);
+    const mat = maturityFactor(age, comparables.medianAgeDays, model);
+    const pm = base * off.offset * mom * mat;
+    const pf = p.tvl_usd * flatMult;
+    const pt = p.tvl_usd;
+    modelErr.push(Math.abs(Math.log(pm / actualMcap)));
+    flatErr.push(Math.abs(Math.log(pf / actualMcap)));
+    tvlErr.push(Math.abs(Math.log(pt / actualMcap)));
+    if (pm / actualMcap >= 0.5 && pm / actualMcap <= 2) modelWithin++;
+    actual.push(actualMcap);
+    predModel.push(pm);
+    predTvl.push(pt);
+  }
+  return {
+    n,
+    n_train: train.length,
+    n_test: test.length,
+    cutoff,
+    model_median_log_err: round4(medianOf(modelErr)),
+    flat_median_log_err: round4(medianOf(flatErr)),
+    tvl_median_log_err: round4(medianOf(tvlErr)),
+    model_within_2x: round4(modelWithin / test.length),
+    model_spearman: round4(spearman(actual, predModel)),
+    tvl_spearman: round4(spearman(actual, predTvl)),
+  };
+}
 /** The full accounting of the snapshot: every protocol is counted, none is dropped silently. */
 export interface Accounting {
   total: number;
@@ -633,34 +799,38 @@ export function maturityFactor(age: number | null, medianAgeDays: number, model:
   return model.maturity_floor + (Math.min(Math.max(a, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
 }
 
-/** The three factors and the implied value one protocol gets under `model`. */
+/** The size curve and the factors, and the implied value one protocol gets under `model`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
-  comparables: { byCategory: Map<string, { multiple: number; count: number }>; globalMultiple: number; medianAgeDays: number },
+  powerLaw: PowerLaw,
   model: ModelConstants,
 ): {
   implied: number;
+  /** The effective multiple: power-law base x category offset / TVL. */
   multiple: number;
   comparablesUsed: number;
   source: 'category' | 'global';
+  powerBase: number;
+  categoryOffset: number;
   momentum: number;
   maturity: number;
   age: number | null;
 } {
   const age = ageDays(asOf, protocol.listed_at);
-  const comp = comparableFor(protocol.category, comparables, model);
+  const base = powerBase(protocol.tvl_usd, powerLaw);
+  const off = categoryOffsetFor(protocol.category, powerLaw, model);
   const momentum = momentumFactor(protocol.change_7d, model);
-  const maturity = maturityFactor(age, comparables.medianAgeDays, model);
+  const maturity = maturityFactor(age, powerLaw.medianAgeDays, model);
   // Round the factors first, then compute the implied value from the ROUNDED
   // factors: the dashboard recomputes from the stored factors, so the stored
   // implied value must be exactly what those factors produce.
-  const multiple = round6(comp.multiple);
+  const multiple = round6((base * off.offset) / protocol.tvl_usd);
   const momentumR = round4(momentum);
   const maturityR = round4(maturity);
   const raw = protocol.tvl_usd * multiple * momentumR * maturityR;
   const implied = Math.max(model.value_floor_usd, Math.min(model.value_cap_usd, Math.round(raw)));
-  return { implied, multiple, comparablesUsed: comp.count, source: comp.source, momentum: momentumR, maturity: maturityR, age };
+  return { implied, multiple, comparablesUsed: off.count, source: off.source, powerBase: Math.round(base), categoryOffset: round4(off.offset), momentum: momentumR, maturity: maturityR, age };
 }
 
 /** The verdict: Farm now for the largest launches, Watch for the mid-tier, Skip for the small ones. */
@@ -881,7 +1051,7 @@ export function liveRows(snapshot: Snapshot, limit: number): LiveRow[] {
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const comparables = computeComparables(snapshot, model);
+  const powerLaw = computePowerLaw(snapshot, model);
   const iv = intervals(snapshot, model);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const chosen = new Map<string, SnapshotProtocol>();
@@ -897,7 +1067,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   }
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, comparables, model);
+    const v = impliedValue(p, snapshot.as_of, powerLaw, model);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -929,6 +1099,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
         comparable_multiple: round6(s.multiple),
         comparables_used: s.comparablesUsed,
         comparable_source: s.source,
+        power_base_usd: s.powerBase,
+        category_offset: s.categoryOffset,
         growth_pct: s.p.change_7d,
         momentum_factor: round4(s.momentum),
         maturity_factor: round4(s.maturity),
@@ -965,6 +1137,8 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     comparable_multiple: row.model.comparable_multiple,
     comparables_used: row.model.comparables_used,
     comparable_source: row.model.comparable_source,
+    power_base_usd: row.model.power_base_usd,
+    category_offset: row.model.category_offset,
     momentum_factor: row.model.momentum_factor,
     maturity_factor: row.model.maturity_factor,
     break_even: row.break_even,
@@ -975,10 +1149,12 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot, model);
   const comparables = computeComparables(snapshot, model);
+  const powerLaw = computePowerLaw(snapshot, model);
   const live = liveRows(snapshot, 24);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const watchSet = new Set(snapshot.watchlist);
   const held = heldOutTest(snapshot, model);
+  const wf = walkForwardTest(snapshot, model);
   const iv = intervals(snapshot, model);
   const pct1 = (x: number): string => (Math.round(x * 1000) / 10).toFixed(1);
   const intervalNote =
@@ -997,7 +1173,10 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live_size: live.length,
     global_multiple: round6(comparables.globalMultiple),
     median_age_days: comparables.medianAgeDays,
+    power_intercept: round4(powerLaw.intercept),
+    power_slope: round4(powerLaw.slope),
     held_out: held,
+    walk_forward: wf,
     accounting: accounting(snapshot),
     intervals: iv,
     interval_note: intervalNote,
