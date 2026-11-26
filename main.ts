@@ -1,7 +1,7 @@
 // A token-radar-01 entry (Node 22, standard library only).
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
-// scores every pre-token protocol with the comparable-multiple model in
+// scores every pre-token protocol with the power-law size-curve model in
 // lib/model.ts, writes the ranked board to /output/board.json, writes the
 // dashboard's data as dashboard/zz-data.js (one minified line, named to sort
 // last in the dossier text so it is the only file cut), copies this
