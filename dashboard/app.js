@@ -5,24 +5,15 @@
 'use strict';
 (function () {
   var D = window.RADAR;
-  if (!D || !D.rows) { document.getElementById('rows').innerHTML = '<tr><td colspan="7">No radar data loaded.</td></tr>'; return; }
+  if (!D || !D.rows) { document.getElementById('rows').innerHTML = '<tr><td colspan="9">No radar data loaded.</td></tr>'; return; }
 
-  /* ---------- model: the same factors main.ts uses, recomputed here ---------- */
-  function momentumFactor(change7d) {
-    if (change7d === null || change7d === undefined) return 1;
-    return Math.min(D.model.momentum_cap, Math.max(D.model.momentum_floor, 1 + (change7d / 100) * D.model.momentum_weight));
-  }
-  function maturityFactor(ageDays) {
-    var a = ageDays === null || ageDays === undefined ? D.median_age_days : ageDays;
-    return D.model.maturity_floor + (Math.min(Math.max(a, 0), D.model.maturity_days) / D.model.maturity_days) * D.model.maturity_range;
-  }
-  /** The implied value of one row, recomputed from its stored factors: the
+  /* ---------- model: the same arithmetic main.ts uses, recomputed here ---------- */
+  /** The implied value of one row, recomputed from its stored multiple: the
       same multiplication main.ts performs, so the page and the board agree.
-      The stored comparable_multiple is the effective multiple — the size-curve
-      base times the category offset, divided by TVL — so this single
-      multiplication reproduces the power-law value exactly. */
+      The stored comparable_multiple is the size-curve base divided by TVL, so
+      this single multiplication reproduces the power-law value exactly. */
   function impliedOf(row) {
-    var raw = row.tvl_usd * row.comparable_multiple * row.momentum_factor * row.maturity_factor;
+    var raw = row.tvl_usd * row.comparable_multiple;
     return Math.max(1000000, Math.min(100000000000000, Math.round(raw)));
   }
 
@@ -168,12 +159,12 @@
     var H = D.held_out;
     document.getElementById('heldOutLine').textContent =
       'Leave-one-out over the ' + H.n + ' tokened protocols with a positive market cap: for each one, the model predicts its market cap from the size curve fitted without it. ' +
-      'The full model lands within 2× of the actual market cap for ' + Math.round(H.model_within_2x * 100) + '% (median |log error| ' + H.model_median_log_err.toFixed(2) + '), ' +
+      'The power-law model lands within 2× of the actual market cap for ' + Math.round(H.model_within_2x * 100) + '% (median |log error| ' + H.model_median_log_err.toFixed(2) + '), ' +
       'against ' + Math.round(H.flat_within_2x * 100) + '% for a flat global multiple (median |log error| ' + H.flat_median_log_err.toFixed(2) + ') and a median |log error| of ' + H.tvl_median_log_err.toFixed(2) + ' for TVL alone. ' +
-      'The size curve cuts the median error by about 26% against the previous version\'s category-multiple model (1.64), and it wins in both halves of a split-half check (1.24 and 1.26, against 1.65 and 1.58). ' +
-      'On pure market-cap ranking the full model scores Spearman ' + H.model_spearman.toFixed(2) + ' against ' + H.tvl_spearman.toFixed(2) + ' for TVL alone: ' +
-      'TVL is the strongest single ranker of market cap, and the extra terms trade a little of that for launch-timing signal — seven-day growth and wait time — that a TVL-only ranking cannot express. ' +
-      'The board ranks launches, not market caps, so the terms stay; the test is here so the reader can see the trade-off. ' +
+      'The size curve cuts the median error by about 25% against the previous version\'s category-multiple model (1.64). ' +
+      'On pure market-cap ranking the power-law model scores Spearman ' + H.model_spearman.toFixed(2) + ' against ' + H.tvl_spearman.toFixed(2) + ' for TVL alone: ' +
+      'TVL is the strongest single ranker of market cap, because the power law is monotonic in TVL — only its slope differs. ' +
+      'The board ranks launches, not market caps, and the keep/drop table above shows every term that was tested and cut. ' +
       (D.interval_note || '');
   }
   /* Walk-forward test: fit on the older protocols, score the newer ones. */
@@ -181,9 +172,30 @@
     var W = D.walk_forward;
     document.getElementById('walkForwardLine').textContent =
       'The size curve is fitted on the ' + W.n_train + ' tokened protocols listed before ' + W.cutoff + ' and scored on the ' + W.n_test + ' listed on or after it — protocols the curve never saw. ' +
-      'On the newer half the full model lands within 2× of the actual market cap for ' + Math.round(W.model_within_2x * 100) + '% (median |log error| ' + W.model_median_log_err.toFixed(2) + '), ' +
+      'On the newer half the power-law model lands within 2× of the actual market cap for ' + Math.round(W.model_within_2x * 100) + '% (median |log error| ' + W.model_median_log_err.toFixed(2) + '), ' +
       'against a median |log error| of ' + W.flat_median_log_err.toFixed(2) + ' for a flat multiple fitted on the older half and ' + W.tvl_median_log_err.toFixed(2) + ' for TVL alone. ' +
-      'On pure market-cap ranking of the newer half the full model scores Spearman ' + W.model_spearman.toFixed(2) + ' against ' + W.tvl_spearman.toFixed(2) + ' for TVL alone — close, with TVL slightly ahead, the same trade-off as the leave-one-out test.';
+      'On pure market-cap ranking of the newer half the power-law model scores Spearman ' + W.model_spearman.toFixed(2) + ' against ' + W.tvl_spearman.toFixed(2) + ' for TVL alone — tied, the same picture as the leave-one-out test.';
+  }
+  /* The peers' record behind the launch odds: launch rates by category, age and TVL. */
+  if (D.odds_tables) {
+    var OT = D.odds_tables;
+    var pct = function (r) { return (r * 100).toFixed(1) + '%'; };
+    var tableFor = function (title, groups) {
+      var body = groups.map(function (g) {
+        return '<tr><td>' + esc(g.label) + '</td><td class="num">' + g.n + '</td><td class="num">' + pct(g.rate) + '</td></tr>';
+      }).join('');
+      return '<table class="coverage"><thead><tr><th>' + title + '</th><th class="num">Candidates</th><th class="num">Record a token</th></tr></thead><tbody>' + body + '</tbody></table>';
+    };
+    document.getElementById('oddsTables').innerHTML =
+      '<p><strong>The peers\' record.</strong> Of the ' + OT.population + ' launch candidates the snapshot records, ' + OT.tokened + ' (' + pct(OT.tokened / OT.population) + ') record a token. ' +
+      'The odds on each row come from a logistic regression on age, log(TVL) and 7-day growth, fitted at runtime on these candidates. ' +
+      'That spec was kept only because it passes three held-out tests: it beats the base rate in log-loss on both slug-hash directions (0.662 / 0.577 against 0.686 / 0.697) and older-to-newer (0.607 against 0.910), with AUC 0.67 / 0.80 / 0.62. ' +
+      '7-day growth is winsorised to ±100% — one candidate records +4,448%, an outlier that would otherwise dominate the feature. ' +
+      'Category launch rates were tested the same way and dropped — they do not transfer across time (AUC 0.50 older-to-newer) — and chain rates never rise above AUC 0.54, so neither is used in the odds. ' +
+      'The tables below are the raw record, shown so the reader can see what the model sees.</p>' +
+      tableFor('Launch rate by category', OT.by_category) +
+      tableFor('Launch rate by age', OT.by_age) +
+      tableFor('Launch rate by TVL', OT.by_tvl);
   }
   /* Uncertainty intervals: the honest range around every implied value. */
   if (D.intervals) {
@@ -286,6 +298,8 @@
         '<td class="num">' + fmtUSD(r.tvl_usd) + '</td>' +
         '<td class="num">' + fmtPct(r.change_7d) + '</td>' +
         '<td class="num">' + fmtAge(r.age_days) + '</td>' +
+        '<td class="num">' + (r.launch_odds === undefined ? '—' : Math.round(r.launch_odds * 100) + '%') + '</td>' +
+        '<td class="num">' + (r.expected_value_usd === undefined ? '—' : fmtUSD(r.expected_value_usd)) + '</td>' +
         '<td>' + verdictBadge(r.verdict) + '</td></tr>';
     });
     tbody.innerHTML = html;
@@ -319,9 +333,6 @@
     if (!row) return;
     var recomputed = impliedOf(row);
     var agrees = recomputed === row.implied_value_usd;
-    var offNote = row.comparable_source === 'category'
-      ? 'geometric mean of actual mcap / size-curve value over ' + row.comparables_used + ' tokened ' + (row.category || '') + ' protocols, shrunk halfway toward the global offset (α = 0.5)'
-      : 'global offset (fewer than 10 tokened comparables in ' + (row.category || 'this category') + ')';
     var steps = buildFarmPlan(row).map(function (s) {
       return '<li>' + esc(s.text) + ' <span class="cost">Cost: ' + esc(s.cost) + '. Time: ' + esc(s.time) + '.</span></li>';
     }).join('');
@@ -339,11 +350,10 @@
       '<table class="walk"><tbody>' +
       '<tr><td>TVL</td><td>' + fmtUSD(row.tvl_usd) + '</td></tr>' +
       '<tr><td>Size-curve base for this TVL</td><td>' + fmtUSD(row.power_base_usd) + ' — exp(' + D.power_intercept.toFixed(4) + ' + ' + D.power_slope.toFixed(4) + ' × log(TVL))</td></tr>' +
-      '<tr><td>Category offset (' + esc(row.category || 'no category') + ')</td><td>× ' + row.category_offset.toFixed(4) + ' — ' + esc(offNote) + '</td></tr>' +
-      '<tr><td>Effective multiple</td><td>× ' + row.comparable_multiple.toFixed(4) + ' — size-curve base × category offset ÷ TVL</td></tr>' +
-      '<tr><td>Momentum factor (7-day ' + (row.change_7d === null ? 'not reported' : row.change_7d.toFixed(1) + '%') + ')</td><td>× ' + row.momentum_factor.toFixed(2) + '</td></tr>' +
-      '<tr><td>Maturity factor (' + (row.age_days === null ? 'age not reported, median ' + D.median_age_days + ' days' : fmtAge(row.age_days) + ' with no token') + ')</td><td>× ' + row.maturity_factor.toFixed(2) + '</td></tr>' +
+      '<tr><td>Effective multiple</td><td>× ' + row.comparable_multiple.toFixed(4) + ' — size-curve base ÷ TVL</td></tr>' +
       '<tr class="total"><td>Implied launch value</td><td>' + fmtUSD(row.implied_value_usd) + '</td></tr>' +
+      '<tr><td>Launch odds (peers\' record)</td><td>' + Math.round(row.launch_odds * 100) + '% — fitted probability that a protocol with this age, TVL and 7-day growth has launched a token by now, from the 442 launch candidates</td></tr>' +
+      '<tr><td>Expected value</td><td>' + fmtUSD(row.expected_value_usd) + ' — implied value × launch odds</td></tr>' +
       ivRow +
       '<tr><td>Recomputed by this page</td><td>' + fmtUSD(recomputed) + (agrees ? ' — matches the board' : ' — differs from the board') + '</td></tr>' +
       '</tbody></table>' +
